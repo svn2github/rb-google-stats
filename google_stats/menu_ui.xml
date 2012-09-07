@@ -1,0 +1,9 @@
+<ui> 
+    <menubar name="MenuBar"> 
+        <menu name="MusicMenu" action="Music">
+            <placeholder name="PluginPlaceholder">
+                <menuitem name="GoogleSyncActionMenuItem" action="GoogleSyncAction"/>
+            </placeholder>
+        </menu>
+    </menubar>
+</ui>

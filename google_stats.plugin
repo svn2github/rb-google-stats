@@ -1,0 +1,10 @@
+[Plugin]
+Loader=python
+Module=google_stats
+IAge=2
+Depends=rb
+Name=Google Stats Sync
+Description=Synchronize Google Music stats
+Authors=Grant Lundberg
+Copyright=Nope
+Website=http://some.website/
