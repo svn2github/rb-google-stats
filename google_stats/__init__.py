@@ -85,6 +85,8 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         label = builder.get_object('label')
         progressbar = builder.get_object('progressbar')
         button =  builder.get_object('button')
+        textview = builder.get_object('textview')
+        textbuffer = textview.get_buffer()
         dialog = builder.get_object('dialog')
         button.connect('clicked', self.button_callback, dialog)
         dialog.connect('response', self.dialog_callback)
@@ -99,7 +101,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         if self.cancel:
             return
 
-
+        
         try:
             req = urllib2.Request(url='https://www.google.com/accounts/ClientLogin',
                     data=urllib.urlencode({'Email': username,
@@ -135,7 +137,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         
         size = len(query_model)
 
-        label.set_text("Updating track (0/%d)..." % (size))
+        label.set_text("Updating tracks...")
         progressbar.set_fraction(0.1)
 
         # Iterate over all entries and update their playCounts and ratings
@@ -144,8 +146,8 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         #self.index = 0
         #Gdk.threads_add_idle(0, self.idle_cb, [google_data, page.props.query_model])
 
-        threshold = progressbar.get_fraction() + 0.01
-        n_updated=0
+        threshold = progressbar.get_fraction() + 0.05
+        #n_updated=0
 
         for i in range(size):
             entry = query_model[i][0]
@@ -163,11 +165,13 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                     google_rating = int(track["rating"])
                     if google_count > count:
                         print "GoogleSyncPlugin::run - updated count: ", title
-                        n_updated += 1
+                        #n_updated += 1
+                        textbuffer.insert(textbuffer.get_end_iter(), "Updated \"%s\"\n" % (title))
                         shell.props.db.entry_set(entry, RB.RhythmDBPropType.PLAY_COUNT, google_count)
                     if google_rating > rating:
                         print "GoogleSyncPlugin::run - updated rating: ", title
-                        n_updated += 1
+                        #n_updated += 1
+                        textbuffer.insert(textbuffer.get_end_iter(), "Updated \"%s\"\n" % (title))
                         shell.props.db.entry_set(entry, RB.RhythmDBPropType.RATING, google_rating)
                     google_data.remove(track)
                     break
@@ -176,7 +180,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             perc = i / float(size)
             if perc > threshold:
                 progressbar.set_fraction(perc)
-                label.set_text("Updating track (%d/%d)..." % (i+1, size))
+                progressbar.set_text("Updating track (%d/%d)..." % (i+1, size))
                 threshold = perc + 0.01
                 while Gtk.events_pending():
                     Gtk.main_iteration()
@@ -185,7 +189,8 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                 return
 
         progressbar.set_fraction(1.0)
-        label.set_text("Updated %d play counts / ratings" % (n_updated))
+        progressbar.set_text("100%")
+        label.set_text("Finished")
         button.set_label("Done")
 
 
