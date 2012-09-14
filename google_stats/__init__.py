@@ -128,7 +128,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
     def fetch_google_tracks(self, username, password):
 
-        if True:
+        if False:
             tracks = gStatsTest.fetch_google_tracks_test(username,
                                             password,
                                             self.plugin_info.get_data_dir())
