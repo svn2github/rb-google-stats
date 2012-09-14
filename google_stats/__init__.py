@@ -128,8 +128,10 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
     def fetch_google_tracks(self, username, password):
 
-        if False:
-            tracks = gStatsTest.fetch_google_tracks_test(username, password)
+        if True:
+            tracks = gStatsTest.fetch_google_tracks_test(username,
+                                            password,
+                                            self.plugin_info.get_data_dir())
         
         else:
             # Login (get auth token)
@@ -165,6 +167,10 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             # Start the idle callback method to update
             #Gdk.threads_add_idle(0, self.update_db_idle_cb, None)
    
+        
+        if False:
+            gStatsTest.cache_tracks(tracks, self.plugin_info.get_data_dir())
+
 
         # Create a dictionary of string --> track
         # key is Title:Album:Artist

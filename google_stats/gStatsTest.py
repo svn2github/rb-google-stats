@@ -1,12 +1,11 @@
 import json
 
-
-# Expects ~/.local/share/rhythmbox/plugins/google_stats/cache/cache.# to exist
-def fetch_google_tracks_test(username, password):
+# Expects ~/.local/share/rhythmbox/plugins/google_stats/cache to exist
+def fetch_google_tracks_test(username, password, plugin_dir):
     
-    filename = '/home/grant/.local/share/rhythmbox/plugins/google_stats/cache/cache'
+    cache_file = "%s/%s" % (plugin_dir, 'cache')
 
-    f = open(filename)
+    f = open(cache_file)
     tracks = json.load(f)['playlist']
     f.close()
 
@@ -14,9 +13,10 @@ def fetch_google_tracks_test(username, password):
 
 
 
-def cache_tracks(tracks):
-    filename = '/home/grant/.local/share/rhythmbox/plugins/google_stats/cache/cache'
-    
-    f = open(filename, 'w')
+def cache_tracks(tracks, plugin_dir):
+
+    cache_file = "%s/%s" % (plugin_dir, 'cache')
+
+    f = open(cache_file, 'w')
     f.write(json.dumps({'playlist': tracks}))
     f.close()
