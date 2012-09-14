@@ -5,6 +5,7 @@ import urllib, urllib2
 import os
 import stat
 import re
+import threading
 
 class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
     object = GObject.property(type=GObject.Object)
@@ -26,6 +27,9 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         ui_file = rb.find_plugin_file(self, 'menu_ui.xml') 
         self.ui_id = uim.add_ui_from_file (ui_file)
         uim.ensure_update ()
+        
+        self.auth_token = None
+        self.xt = None
 
 
     def do_deactivate(self):
@@ -76,23 +80,20 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         
         (username, password) = self.get_account_info() 
        
-        query_model = shell.props.library_source.props.query_model
-
         self.cancel = False
 
         builder = Gtk.Builder()
         builder.add_from_file(rb.find_plugin_file(self, 'progress.ui'))
-        label = builder.get_object('label')
-        progressbar = builder.get_object('progressbar')
-        button =  builder.get_object('button')
+        self.label = builder.get_object('label')
+        self.progressbar = builder.get_object('progressbar')
+        self.button =  builder.get_object('button')
         textview = builder.get_object('textview')
-        textbuffer = textview.get_buffer()
+        self.textbuffer = textview.get_buffer()
         dialog = builder.get_object('dialog')
-        button.connect('clicked', self.button_callback, dialog)
+        self.button.connect('clicked', self.button_callback, dialog)
         dialog.connect('response', self.dialog_callback)
 
         dialog.show_all()
-
 
         while Gtk.events_pending():
              Gtk.main_iteration()
@@ -100,63 +101,162 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
         if self.cancel:
             return
+       
 
-        google_data = get_google_tracks(username, password) 
+        self.query_model = shell.props.library_source.props.query_model
+        self.db = shell.props.db
 
-        size = len(query_model)
+        #Gdk.threads_add_idle(0, self.fetch_google_tracks_idle_cb, [username, password])
+        self.fetch_google_tracks(username, password)
+        self.update_db()
 
-        label.set_text("Updating %d tracks..." % (len(google_data)))
-        progressbar.set_fraction(0.1)
+        # cleanup 
+        del self.google_tracks
+        del self.progressbar
+        del self.label
+        del self.button
+        del self.textbuffer
+        del self.db
+        del self.query_model
+        
+        
 
-        # Iterate over all entries and update their playCounts and ratings
-        # ToDo: this should be done in an idle callback
-        #       e.g. Gdk.threads_add_idle(0, self.idle_cb, None)
-        #self.index = 0
-        #Gdk.threads_add_idle(0, self.idle_cb, [google_data, page.props.query_model])
+    def fetch_google_tracks(self, username, password):
 
-        threshold = progressbar.get_fraction() + 0.05
+        self.google_tracks = []
+
+        # Login (get auth token)
+        if self.auth_token == None:
+            req = urllib2.Request(url='https://www.google.com/accounts/ClientLogin',
+                        data=urllib.urlencode({'Email': username,
+                                               'Passwd': password,
+                                               'source': 'music', 'service': 'sj',
+                                               'accountType': 'GOOGLE'}))
+            f = urllib2.urlopen(req)
+    
+            for line in (f.readlines()):
+                if line.find('Auth=') > -1:
+                    self.auth_token=line[5:].rstrip()
+                    break
+   
+
+        # Get xt token
+        if self.xt == None:
+            req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
+                            data="u=0",
+                            headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
+        
+            f = urllib2.urlopen(req)
+    
+            pattern = re.compile('^.*xt=([^;]+);.*$')
+            m = pattern.match(f.headers.getheader('Set-Cookie'))
+            if m:
+                self.xt = m.group(1)
+    
+        
+        # Get first chunk of songs
+        req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
+                    data=urllib.urlencode({'u':0, 'xt':self.xt}),  
+                    headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
+    
+        f = urllib2.urlopen(req)
+    
+        data = json.loads(f.read())
+    
+        self.google_tracks = data['playlist']
+    
+        # Get subsequent chunks
+        while 'continuationToken' in data:
+            ct = data['continuationToken']
+            req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
+                            data=urllib.urlencode({'u':0, 'xt':self.xt, 
+                                'json': "{\"continuationToken\": \"%s\"}" % (ct)}),  
+                            headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
+            f = urllib2.urlopen(req)
+            data = json.loads(f.read())
+            self.google_tracks.extend(data['playlist'])
+    
+        # Start the idle callback method to update
+        #Gdk.threads_add_idle(0, self.update_db_idle_cb, None)
+   
+
+
+
+
+    def update_db(self):
+        
+        size = len(self.query_model)
+        threshold = self.progressbar.get_fraction() + 0.05
+
+        self.label.set_text("Updating %d tracks..." % (len(self.google_tracks)))
+        self.progressbar.set_fraction(0.1)
+
+        # build a list of tracks to be uploaded to Google
+        google_updates = []
 
         for i in range(size):
-            entry = query_model[i][0]
-            
-            lhsTrack = {'title': entry.get_string(RB.RhythmDBPropType.TITLE),
+            entry = self.query_model[i][0]
+           
+            # Rhythmbox track
+            rbTrack = {'title':  entry.get_string(RB.RhythmDBPropType.TITLE),
                         'artist': entry.get_string(RB.RhythmDBPropType.ARTIST),
-                        'album': entry.get_string(RB.RhythmDBPropType.ALBUM)}
+                        'album':  entry.get_string(RB.RhythmDBPropType.ALBUM)}
             
             count = entry.get_ulong(RB.RhythmDBPropType.PLAY_COUNT)
             rating = entry.get_double(RB.RhythmDBPropType.RATING)
             title = ""
 
-            # Lookup the entry in the google_data dictionary
-            for track in google_data:
+            # Lookup the entry in the self.google_tracks dictionary
+            found=False
+            for gTrack in self.google_tracks:
                 
-                rhsTrack = {'title': track['title'],
-                            'artist': track['artist'],
-                            'album': track['album']}
-                
-                if compare_tracks(lhsTrack, rhsTrack):
-                    title = entry.get_string(RB.RhythmDBPropType.TITLE)
-                    google_count = int(track["playCount"])
-                    google_rating = int(track["rating"])
+                if compare_tracks(rbTrack, gTrack):
+                    
+                    google_count = int(gTrack['playCount'])
+                    google_rating = int(gTrack['rating'])
                     updated=False
+                    gDict = None
+
+                    # if Google > Rhythmbox --> update Rhythmbox
+                    # else if Rhythmbox > Google --> update Google
                     if google_count > count:
-                        shell.props.db.entry_set(entry, RB.RhythmDBPropType.PLAY_COUNT, google_count)
                         updated=True
+                        self.db.entry_set(entry, RB.RhythmDBPropType.PLAY_COUNT, google_count)
+                    elif count > google_count:
+                        updated=True
+                        gDict = {'id': gTrack['id'],
+                                 'playCount': count,
+                                 'title': gTrack['title']}
+                    
                     if google_rating > rating:
-                        shell.props.db.entry_set(entry, RB.RhythmDBPropType.RATING, google_rating)
                         updated=True
-                    google_data.remove(track)
+                        self.db.entry_set(entry, RB.RhythmDBPropType.RATING, google_rating)
+                    elif rating > google_rating:
+                        updated=True
+                        if gDict == None:
+                            gDict = {'id': gTrack['id'], 'title':gTrack['title']}
+                        gDict['rating'] = rating
+                    
+                    self.google_tracks.remove(gTrack)
+                    
+                    if gDict != None:
+                        google_updates.append(gDict)
 
                     if updated:
-                        textbuffer.insert(textbuffer.get_end_iter(), "Updated \"%s\"\n" % (title))
+                        self.textbuffer.insert(self.textbuffer.get_end_iter(),
+                                          "Updated \"%s\"\n" % (rbTrack['title']))
 
+                    found=True
                     break
+
+            if found == False:
+                print "GoogleSyncPlugin - no match for %s - %s -%s" % (rbTrack['artist'], rbTrack['album'], rbTrack['title'])
 
             # Update the progress in the GUI
             perc = i / float(size)
             if perc > threshold:
-                progressbar.set_fraction(perc)
-                progressbar.set_text("Updating track (%d/%d)..." % (i+1, size))
+                self.progressbar.set_fraction(perc)
+                self.progressbar.set_text("(%d/%d)..." % (i+1, size))
                 threshold = perc + 0.01
                 while Gtk.events_pending():
                     Gtk.main_iteration()
@@ -164,10 +264,23 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             if self.cancel:
                 return
 
-        progressbar.set_fraction(1.0)
-        progressbar.set_text("100%")
-        label.set_text("Finished")
-        button.set_label("Done")
+        self.progressbar.set_fraction(1.0)
+        self.progressbar.set_text("100%")
+        self.label.set_text("Finished")
+        self.button.set_label("Done")
+
+
+        if len(google_updates) > 0:
+
+            entries_str = json.dumps({'entries': google_updates})
+        
+            req = urllib2.Request(url='https://play.google.com/music/services/modifyentries',
+                            data=urllib.urlencode({'u':0,'xt':self.xt, 'json': entries_str}),  
+                            headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
+
+            f = urllib2.urlopen(req)
+
+
 
 
 
@@ -213,7 +326,7 @@ def save_account_info(username, password, plugin_info):
     if username == None or username == "" or password == None or password == "":
         return
 
-    filename = "%s/%s" % (plugin_info.get_data_dir(), "account.dat")
+    filename = "%s/%s" % (plugin_info.get_data_dir(), 'account.dat')
     f = open(filename, 'w')
     f.write("%s\n%s" % (username, password))
     f.close()
@@ -221,70 +334,12 @@ def save_account_info(username, password, plugin_info):
     os.chmod(filename, (stat.S_IREAD | stat.S_IWRITE))
 
 
-def get_google_tracks(username, password):
+
+def compare_tracks(lhsTrack, rhsTrack):
     
-    # Login (get auth token)
-    req = urllib2.Request(url='https://www.google.com/accounts/ClientLogin',
-                    data=urllib.urlencode({'Email': username,
-                                           'Passwd': password,
-                                           'source': 'music', 'service': 'sj',
-                                           'accountType': 'GOOGLE'}))
-
-    f = urllib2.urlopen(req)
-
-    auth_token=''
-
-    for line in (f.readlines()):
-        if line.find('Auth=') > -1:
-            auth_token=line[5:].rstrip()
-            break
-
-    # Get xt token
-    xt_token=''
-
-    req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
-                          data="u=0",
-                          headers={'Authorization': "GoogleLogin auth=%s" % auth_token})
-    
-    f = urllib2.urlopen(req)
-
-    pattern = re.compile('^.*xt=([^;]+);.*$')
-    m = pattern.match(f.headers.getheader('Set-Cookie'))
-    if m:
-        token = m.group(1)
-
-    
-    # Get first chunk of songs
-    req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
-                data=urllib.urlencode({'u':0, 'xt':token}),  
-                headers={'Authorization': "GoogleLogin auth=%s" % auth_token})
-
-    f = urllib2.urlopen(req)
-
-    data = json.loads(f.read())
-
-    songs = data['playlist']
-
-    # Get subsequent chunks
-    while 'continuationToken' in data:
-        ct = data['continuationToken']
-        req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
-                        data=urllib.urlencode({'u':0, 'xt':token, 
-                            'json': "{\"continuationToken\": \"%s\"}" % (ct)}),  
-                        headers={'Authorization': "GoogleLogin auth=%s" % auth_token})
-        f = urllib2.urlopen(req)
-        data = json.loads(f.read())
-        songs.extend(data['playlist'])
-
-    return songs
-
-
-
-def compare_tracks(rhsTrack, lhsTrack):
-    
-    if lhsTrack['title'].encode('utf-8') == rhsTrack['title']:
-        if lhsTrack['artist'].encode('utf-8') == rhsTrack['artist']:
-            if lhsTrack['album'].encode('utf-8') == rhsTrack['album']:
+    if lhsTrack['title'] == rhsTrack['title'].encode('utf-8'):
+        if lhsTrack['album'] == rhsTrack['album'].encode('utf-8'):
+            if lhsTrack['artist'] == rhsTrack['artist'].encode('utf-8'):
                 return True
     
     return False
