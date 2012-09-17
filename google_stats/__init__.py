@@ -15,7 +15,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
     def do_activate(self):
         shell = self.object
         self.action = Gtk.Action(name='GoogleSyncAction',
-                                label=_("Sync with Google statistics..."),
+                                label=_("Sync Statistics..."),
                                 tooltip=_("Synchronize music statistics with Google"),
                                 stock_id='')
         self.action.connect ('activate', self.sync_google_stats, shell)
@@ -89,7 +89,10 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         treeview = builder.get_object('treeview')
         self.liststore = builder.get_object('liststore')
 
-        treeview.append_column(Gtk.TreeViewColumn('Title', Gtk.CellRendererText(), text=0))
+        titleColumn = Gtk.TreeViewColumn('Title', Gtk.CellRendererText(), text=0)
+        titleColumn.set_min_width(195)
+        titleColumn.set_max_width(195)
+        treeview.append_column(titleColumn)
         treeview.append_column(Gtk.TreeViewColumn('Plays', Gtk.CellRendererText(), text=1))
         treeview.append_column(Gtk.TreeViewColumn('Rating', Gtk.CellRendererText(),text=2))
         treeview.set_model(self.liststore)
@@ -177,6 +180,8 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         self.google_tracks = {}
         for track in tracks:
             key = "%s:%s:%s" % (track['title'], track['album'], track['artist'])
+            if key in self.google_tracks:
+                print "GoogleSyncPlugin ERROR duplicate key: %s" % (key)
             self.google_tracks[key] = track
             
 
@@ -203,6 +208,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             rb_count = entry.get_ulong(RB.RhythmDBPropType.PLAY_COUNT)
             rb_rating = entry.get_double(RB.RhythmDBPropType.RATING)
             rb_last_played = entry.get_ulong(RB.RhythmDBPropType.LAST_PLAYED)
+            rb_genre =  unicode(entry.get_string(RB.RhythmDBPropType.GENRE), 'utf-8')
 
             # Lookup the entry in the self.google_tracks dictionary
             key = unicode("%s:%s:%s" % (rbTrack['title'],
@@ -223,20 +229,20 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                     
                 # Play Count
                 new_count = max(rb_count, google_count)
-                if new_count > rb_count:
+                if google_count > rb_count:
                     updated=True
                     self.db.entry_set(entry, RB.RhythmDBPropType.PLAY_COUNT, new_count)
-                elif rb_count > new_count:
+                elif rb_count > google_count:
                     updated=True
                     gDict = {'id': gTrack['id'],
                              'playCount': new_count}
-                    
+                 
                 # Rating
                 new_rating = max(rb_rating, google_rating)
-                if new_rating > rb_rating:
+                if google_rating > rb_rating:
                     updated=True
                     self.db.entry_set(entry, RB.RhythmDBPropType.RATING, new_rating)
-                elif rb_rating > new_rating:
+                elif rb_rating > google_rating:
                     updated=True
                     if gDict == None:
                         gDict = {'id': gTrack['id']}
@@ -244,14 +250,23 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                 
                 # Last Played
                 new_last_played = max(rb_last_played, google_last_played)
-                if new_last_played > rb_last_played:
+                if google_last_played > rb_last_played:
                     updated=True
                     self.db.entry_set(entry, RB.RhythmDBPropType.LAST_PLAYED, new_last_played)
-                elif rb_last_played > new_last_played:
+                elif rb_last_played > google_last_played:
                     updated=True
                     if gDict == None:
                         gDict = {'id': gTrack['id']}
                     gDict['lastPlayed'] = new_last_played * 1000000
+
+                # Genre
+                #if gTrack['genre'] != rb_genre:
+                #    updated=True
+                    #print "GoogleSyncPlugin updating genre %s" % (gTrack['genre'])
+                    #self.db.entry_set(entry, RB.RhythmDBPropType.GENRE, str(gTrack['genre']))
+                #    if gDict == None:
+                #        gDict = {'id': gTrack['id']}
+                #    gDict['genre'] = rb_genre
 
 
                 if gDict != None:
@@ -284,9 +299,10 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         self.button.set_label("Done")
 
 
+        # Send changes to Google
         if len(google_updates) > 0:
-            print "GoogleSyncPlugin - sending these changes to Google: %s" % (entries_str)
             entries_str = json.dumps({'entries': google_updates})
+            print "GoogleSyncPlugin - sending these changes to Google: %s" % (entries_str)
             req = urllib2.Request(url='https://play.google.com/music/services/modifyentries',
                            data=urllib.urlencode({'u':0,'xt':self.xt, 'json': entries_str}),  
                            headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
