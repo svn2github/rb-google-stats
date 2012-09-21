@@ -1,11 +1,11 @@
-import gStatsUtil, gStatsTest
-from gi.repository import GObject, RB, Peas, Gtk, Gdk, PeasGtk
+import gStatsUtil
+from gi.repository import GObject, RB, Peas, Gtk, PeasGtk
 import rb
 import json
 import urllib, urllib2
-import os, stat
 import time
 import sqlite3
+
 
 class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
     object = GObject.property(type=GObject.Object)
@@ -16,13 +16,18 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         self.use_cache  = False
         self.dump_cache = False
         self.test       = False
-       
         # Authentication credentials
         self.username = None
         self.password = None
         self.auth_token = None
         self.xt_token = None
-        
+        # Other things
+        self.updating = False
+        self.timer_id = None
+        self.data_dir = None
+        self.google_update_queue = {}
+
+
 
     def do_activate(self):
         shell = self.object
@@ -39,6 +44,8 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         self.ui_id = uim.add_ui_from_file (ui_file)
         uim.ensure_update()
 
+        self.data_dir = self.plugin_info.get_data_dir()
+
         # Get Login info 
         account_file = rb.find_plugin_file(self, 'account.dat')
         if account_file != None:
@@ -47,7 +54,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             self.password = f.readline()
 
         # Add callback for database entry changes (playCount, lastPlayed, etc)
-        shell.props.db.connect('entry-changed', self.entry_change_cb)
+        self.entry_changed_id = shell.props.db.connect('entry-changed', self.entry_change_cb)
 
 
 
@@ -70,11 +77,14 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
 
     def entry_change_cb(self, db, entry, changes):
-        if self.username == None or self.password == None:
-            return
         
+        if self.username == None or self.password == None or self.updating:
+            return
+
+        print "entry_change_cb"
+
         updated=False
-        track = {'id': build_key(entry)}
+        track = {'id': self.rb_to_google_id(entry)}
 
         for i in range(changes.n_values):
             change = changes.get_nth(i)
@@ -84,18 +94,36 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             elif change.prop == RB.RhythmDBPropType.LAST_PLAYED:
                 updated=True
                 track['lastPlayed'] = change.new * 1000000
+            elif change.prop == RB.RhythmDBPropType.RATING:
+                track['rating'] = change.new
+                updated=True
             #else:
             #    print "GoogleSyncPlugin - entry_change_cb: %s" % (change.prop)
 
         if updated:
-            (auth_token, xt) = self.get_auth_tokens()
-            entries_str = json.dumps({'entries': [track]})
+            # Add this track to the queue
+            self.google_update_queue[track['id']] = track
+            if self.timer_id == None:
+                print "CREATED UPDATE TIMER"
+                self.timer_id = GObject.timeout_add_seconds(60, self.google_update_timer_cb)
+
+
+
+    def google_update_timer_cb(self):
+        size = len(self.google_update_queue)
+        if size > 0:
+            self.get_auth_tokens()
+            entries_str = json.dumps({'entries': self.google_update_queue.values()})
+            self.google_update_queue = {} 
             req = urllib2.Request(url='https://play.google.com/music/services/modifyentries',
-                           data=urllib.urlencode({'u':0,'xt':xt, 'json': entries_str}),  
-                           headers={'Authorization': "GoogleLogin auth=%s" % auth_token})
+                    data=urllib.urlencode({'u':0,'xt':self.xt_token, 'json': entries_str}),
+                    headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
             f = urllib2.urlopen(req)
-            print "GoogleSyncPlugin - %s" % (f.read())
+            print "google_update_timer_cb result: %s" % (f.read())
         
+        self.timer_id = None
+        return False
+
 
 
     def dialog_callback(self, dialog, response_id=None):
@@ -120,7 +148,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
             self.username = builder.get_object('usernameEntry').get_text()
             self.password = builder.get_object('passwordEntry').get_text()
-            save_account_info(username, password, self.plugin_info)
+            gStatsUtil.save_account_info(username, password, self.data_dir)
 
             dialog.destroy()
 
@@ -170,11 +198,15 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         self.query_model = shell.props.library_source.props.query_model
         self.db = shell.props.db
 
-        self.fetch_google_tracks(username, password)
+        res = gStatsUtil.fetch_google_tracks(self.username, self.password,
+                                    self.auth_token, self.xt_token, self.use_cache,
+                                    self.dump_cache, self.data_dir)
+        self.auth_token = res[0]
+        self.xt_token = res[1]
+
         self.update_db()
 
         # cleanup 
-        del self.google_tracks
         del self.progressbar
         del self.label
         del self.button
@@ -184,95 +216,53 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         
         
 
-
-    def fetch_google_tracks(self, username, password):
-
-        if self.use_cache:
-            tracks = gStatsTest.fetch_google_tracks_test(username,
-                                            password,
-                                            self.plugin_info.get_data_dir())
-        else:
-            # Login (get auth tokens)
-            if self.auth_token == None or self.xt_token == None:
-                self.get_auth_tokens()
-
-            # Get first chunk of songs
-            req = urllib2.Request(url='https://play.google.com/music/services/loadalltracks',
-                        data=urllib.urlencode({'u':0, 'xt':self.xt_token}),  
-                        headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
-            f = urllib2.urlopen(req)
-            res = f.read()
-            jdata = json.loads(res)
-            tracks = jdata['playlist']
-    
-            # Get subsequent chunks
-            while 'continuationToken' in jdata:
-                ct = jdata['continuationToken']
-                req = urllib2.Request(
-                            url='https://play.google.com/music/services/loadalltracks',
-                            data=urllib.urlencode({'u':0, 'xt':self.xt_token, 
-                                'json': "{\"continuationToken\": \"%s\"}" % (ct)}),  
-                            headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
-                f = urllib2.urlopen(req)
-                res = f.read()
-                jdata = json.loads(res)
-                tracks.extend(jdata['playlist'])
-    
-        
-        if self.dump_cache:
-            gStatsTest.cache_tracks(tracks, self.plugin_info.get_data_dir())
-
-
-        # Create a dictionary of string --> track
-        # key is Title:Album:Artist
-        self.google_tracks = {}
-        for track in tracks:
-            key = "%s|%s|%s" % (track['title'], track['album'], track['artist'])
-            if key in self.google_tracks:
-                print "GoogleSyncPlugin ERROR duplicate key: %s" % (key)
-            self.google_tracks[key] = track
-            
-
-
-
     def update_db(self):
         
+        self.updating = True
+
         size = len(self.query_model)
         threshold = self.progressbar.get_fraction() + 0.05
 
-        self.label.set_text("Updating %d tracks..." % (len(self.google_tracks)))
+        self.label.set_text("Updating %d tracks..." % (size))
         self.progressbar.set_fraction(0.10)
+
+        db_filename = "%s/%s" % (self.plugin_info.get_data_dir(), 'cache.db')
+        conn = sqlite3.connect(db_filename)
+        c = conn.cursor()
 
         for i in range(size):
             entry = self.query_model[i][0]
            
             # Rhythmbox track
-            rbTrack = {'title':  entry.get_string(RB.RhythmDBPropType.TITLE),
-                       'artist': entry.get_string(RB.RhythmDBPropType.ARTIST),
-                       'album':  entry.get_string(RB.RhythmDBPropType.ALBUM)}
+            rbTrack = {'title':  unicode(entry.get_string(RB.RhythmDBPropType.TITLE), 'utf-8'),
+                       'artist': unicode(entry.get_string(RB.RhythmDBPropType.ARTIST), 'utf-8'),
+                       'album':  unicode(entry.get_string(RB.RhythmDBPropType.ALBUM), 'utf-8')}
             
             rb_count = entry.get_ulong(RB.RhythmDBPropType.PLAY_COUNT)
             rb_rating = entry.get_double(RB.RhythmDBPropType.RATING)
             rb_last_played = entry.get_ulong(RB.RhythmDBPropType.LAST_PLAYED)
-            rb_genre =  unicode(entry.get_string(RB.RhythmDBPropType.GENRE), 'utf-8')
+            #rb_genre =  unicode(entry.get_string(RB.RhythmDBPropType.GENRE), 'utf-8')
 
-            # Lookup the entry in the self.google_tracks dictionary
-            key = unicode("%s|%s|%s" % (rbTrack['title'],
-                                        rbTrack['album'],
-                                        rbTrack['artist']), 'utf-8')
+            # Lookup the entry in the db
+            c.execute('''SELECT rating,lastPlayed,playCount FROM google
+                        WHERE title=? AND album=? AND artist=?''',
+                        (rbTrack['title'], rbTrack['album'], rbTrack['artist']))
 
-            if key in self.google_tracks:
+            row = c.fetchone()
+
+            if row:
                 
-                gTrack = self.google_tracks[key]
-                google_count = int(gTrack['playCount'])
-                google_rating = int(gTrack['rating'])
-                google_last_played = int(gTrack['lastPlayed']) / 1000000
+                google_rating = row[0]
+                google_last_played = row[1] / 1000000
+                google_count = row[2]
+                
                 updated=False
                     
                 # Play Count
                 new_count = max(rb_count, google_count)
                 if google_count > rb_count:
                     updated=True
+                    print "playCount: %d --> %d" % (rb_count, google_count)
                     if self.test == False:
                         self.db.entry_set(entry, RB.RhythmDBPropType.PLAY_COUNT, new_count)
                  
@@ -280,6 +270,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                 new_rating = max(rb_rating, google_rating)
                 if google_rating > rb_rating:
                     updated=True
+                    print "rating: %d --> %d" % (rb_rating, google_rating)
                     if self.test == False:
                         self.db.entry_set(entry, RB.RhythmDBPropType.RATING, new_rating)
                 
@@ -287,6 +278,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                 new_last_played = max(rb_last_played, google_last_played)
                 if google_last_played > rb_last_played:
                     updated=True
+                    print "lastPlayed: %s --> %s" % (rb_last_played, google_last_played)
                     if self.test == False:
                         self.db.entry_set(entry, RB.RhythmDBPropType.LAST_PLAYED, new_last_played)
 
@@ -299,7 +291,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                                            lastPlayed_str])
 
             else:
-                print "GoogleSyncPlugin - no match for %s" % (key)
+                print "GoogleSyncPlugin - no match for %s" % (rbTrack['title'])
 
             # Update the progress in the GUI
             perc = i / float(size)
@@ -318,6 +310,24 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         self.label.set_text("Finished")
         self.button.set_label("Done")
 
+        self.updating = False
+
+
+
+
+    def rb_to_google_id(self, entry):
+        db_file = rb.find_plugin_file(self, 'cache.db')
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('SELECT id FROM google WHERE artist=? AND album=? AND title=?',
+                        (entry.get_string(RB.RhythmDBPropType.ARTIST).decode('utf-8'),
+                        entry.get_string(RB.RhythmDBPropType.ALBUM).decode('utf-8'),
+                        entry.get_string(RB.RhythmDBPropType.TITLE).decode('utf-8')))
+        track_id = c.fetchone()[0]
+        c.close()
+        conn.close()
+        return track_id
+
 
 
 
@@ -332,7 +342,7 @@ class GoogleSyncConfig(GObject.GObject, PeasGtk.Configurable):
         def account_details_changed(entry, event):
             username = builder.get_object('usernameEntry').get_text()
             password = builder.get_object('passwordEntry').get_text()
-            save_account_info(username, password, self.plugin_info)
+            gStatsUtil.save_account_info(username, password, self.plugin_info.get_data_dir())
             return False
 
 
@@ -356,40 +366,3 @@ class GoogleSyncConfig(GObject.GObject, PeasGtk.Configurable):
         return dialog
 
 
-
-def save_account_info(username, password, plugin_info):
-    if username == None or username == "" or password == None or password == "":
-        return
-
-    filename = "%s/%s" % (plugin_info.get_data_dir(), 'account.dat')
-    f = open(filename, 'w')
-    f.write("%s\n%s" % (username, password))
-    f.close()
-
-    os.chmod(filename, (stat.S_IREAD | stat.S_IWRITE))
-
-
-
-
-def compare_tracks(lhsTrack, rhsTrack):
-    
-    if lhsTrack['title'] == rhsTrack['title'].encode('utf-8'):
-        if lhsTrack['album'] == rhsTrack['album'].encode('utf-8'):
-            if lhsTrack['artist'] == rhsTrack['artist'].encode('utf-8'):
-                return True
-    
-    return False
-
-
-
-
-def build_key(entry):
-    conn = sqlite3.connect('/home/grant/.config/google-musicmanager/ServerDatabase.db')
-    c = conn.cursor()
-    c.execute("SELECT ServerId FROM XFILES WHERE MusicName = \"%s\" AND MusicAlbum = \"%s\" AND MusicArtist = \"%s\"" % (entry.get_string(RB.RhythmDBPropType.TITLE),
-                          entry.get_string(RB.RhythmDBPropType.ALBUM),
-                          entry.get_string(RB.RhythmDBPropType.ARTIST)))
-    track_id = c.fetchone()[0]
-    c.close()
-    conn.close()
-    return track_id
