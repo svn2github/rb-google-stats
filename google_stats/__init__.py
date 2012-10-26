@@ -1,11 +1,25 @@
 import gStatsUtil
-from gi.repository import GObject, RB, Peas, Gtk, PeasGtk
+from gi.repository import GObject, RB, Peas, Gtk, PeasGtk, GLib
 import rb
 import json
 import urllib, urllib2
 import time
 import sqlite3
 
+
+def comparefunction(treemodel, iter1, iter2, user_data):
+    lastPlayed1 = time.mktime(time.strptime(treemodel.get_value(iter1, 3), "%b %d %y %I:%M %p"))
+    lastPlayed2 = time.mktime(time.strptime(treemodel.get_value(iter2, 3), "%b %d %y %I:%M %p"))
+    
+    val = lastPlayed2 - lastPlayed1
+    
+    if val != 0:
+        return val
+
+    return cmp(treemodel.get_value(iter1, 0), treemodel.get_value(iter2, 0))
+	
+
+	
 
 class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
     object = GObject.property(type=GObject.Object)
@@ -56,6 +70,18 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         # Add callback for database entry changes (playCount, lastPlayed, etc)
         self.entry_changed_id = shell.props.db.connect('entry-changed', self.entry_change_cb)
 
+        # Restore and send any pending updates
+        save_file = "{0}/save.json".format(self.data_dir)
+        import os
+        if os.path.isfile(save_file):    
+            f = open(save_file, 'r')
+            self.google_update_queue = json.load(f)
+            f.close()
+            os.remove(save_file)
+            if len(self.google_update_queue) > 0:
+                self.google_update_timer_cb()
+
+
 
 
     def get_auth_tokens(self):
@@ -73,7 +99,15 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         uim.remove_action_group(self.action_group)
         uim.remove_ui(self.ui_id)
         uim.ensure_update()
+        
+        # Save any pending updates
+        if len(self.google_update_queue) > 0:
+            save_file = "{0}/save.json".format(self.data_dir)
+            f = open(save_file, 'w')
+            f.write(json.dumps(self.google_update_queue))
+            f.close()
 
+        
 
 
     def entry_change_cb(self, db, entry, changes):
@@ -105,21 +139,20 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
             self.google_update_queue[track['id']] = track
             if self.timer_id == None:
                 print "CREATED UPDATE TIMER"
-                self.timer_id = GObject.timeout_add_seconds(60, self.google_update_timer_cb)
+                self.timer_id = GObject.timeout_add_seconds(12, self.google_update_timer_cb)
 
 
 
     def google_update_timer_cb(self):
-        size = len(self.google_update_queue)
-        if size > 0:
+        if len(self.google_update_queue) > 0:
             self.get_auth_tokens()
             entries_str = json.dumps({'entries': self.google_update_queue.values()})
             self.google_update_queue = {} 
             req = urllib2.Request(url='https://play.google.com/music/services/modifyentries',
                     data=urllib.urlencode({'u':0,'xt':self.xt_token, 'json': entries_str}),
-                    headers={'Authorization': "GoogleLogin auth=%s" % self.auth_token})
+                    headers={'Authorization': "GoogleLogin auth={0}".format(self.auth_token)})
             f = urllib2.urlopen(req)
-            print "google_update_timer_cb result: %s" % (f.read())
+            print "google_update_timer_cb result: {0}".format(f.read())
         
         self.timer_id = None
         return False
@@ -157,6 +190,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
 
     def sync_google_stats(self, action, shell):
+        
         (username, password) = self.get_account_info() 
        
         self.cancel = False
@@ -172,13 +206,18 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         titleColumn = Gtk.TreeViewColumn('Title', Gtk.CellRendererText(), text=0)
         titleColumn.set_min_width(210)
         titleColumn.set_max_width(210)
+        
         treeview.append_column(titleColumn)
-        treeview.append_column(
-                Gtk.TreeViewColumn('Plays', Gtk.CellRendererText(), text=1))
-        treeview.append_column(
-                Gtk.TreeViewColumn('Rating', Gtk.CellRendererText(),text=2))
-        treeview.append_column(
-                Gtk.TreeViewColumn('Last Played', Gtk.CellRendererText(),text=3))
+        treeview.append_column(Gtk.TreeViewColumn('Plays', Gtk.CellRendererText(), text=1))
+        treeview.append_column(Gtk.TreeViewColumn('Rating', Gtk.CellRendererText(),text=2))
+        
+        playedColumn = Gtk.TreeViewColumn('Last Played', Gtk.CellRendererText(),text=3)
+        
+        self.liststore.set_default_sort_func(comparefunction)
+        self.liststore.set_sort_column_id(-1, 0)
+        
+
+        treeview.append_column(playedColumn)
         treeview.set_model(self.liststore)
         
         dialog = builder.get_object('dialog')
@@ -197,15 +236,20 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
         self.query_model = shell.props.library_source.props.query_model
         self.db = shell.props.db
-
+        
         res = gStatsUtil.fetch_google_tracks(self.username, self.password,
                                     self.auth_token, self.xt_token, self.use_cache,
                                     self.dump_cache, self.data_dir)
         self.auth_token = res[0]
         self.xt_token = res[1]
 
-        self.update_db()
+        gStatsUtil.fetch_playlists(self.username, self.password, self.auth_token, self.xt_token, self.data_dir)
 
+        if (self.auth_token != None and self.xt_token != None) or self.use_cache:
+            self.update_db(shell)
+        else:
+            self.label.set_markup('<span color="red">Error: Unable to login to Google</span>')
+            
         # cleanup 
         del self.progressbar
         del self.label
@@ -213,48 +257,69 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
         del self.liststore
         del self.db
         del self.query_model
-        
+
+
         
 
-    def update_db(self):
+    def update_db(self, shell):
         
         self.updating = True
 
         size = len(self.query_model)
         threshold = self.progressbar.get_fraction() + 0.05
 
-        self.label.set_text("Updating %d tracks..." % (size))
+        self.label.set_text("Updating {0} tracks...".format(size))
         self.progressbar.set_fraction(0.10)
 
-        db_filename = "%s/%s" % (self.plugin_info.get_data_dir(), 'cache.db')
+        
+        db_filename = "{0}/cache.db".format(self.data_dir)
         conn = sqlite3.connect(db_filename)
         c = conn.cursor()
 
         for i in range(size):
             entry = self.query_model[i][0]
-           
+          
+            rb_title = entry.get_string(RB.RhythmDBPropType.TITLE)
+
             # Rhythmbox track
-            rbTrack = {'title':  unicode(entry.get_string(RB.RhythmDBPropType.TITLE), 'utf-8'),
-                       'artist': unicode(entry.get_string(RB.RhythmDBPropType.ARTIST), 'utf-8'),
-                       'album':  unicode(entry.get_string(RB.RhythmDBPropType.ALBUM), 'utf-8')}
+            rbTrack = {'title':  unicode(rb_title,'utf-8'),
+                       'artist': unicode(entry.get_string(RB.RhythmDBPropType.ARTIST),'utf-8'),
+                       'album':  unicode(entry.get_string(RB.RhythmDBPropType.ALBUM),'utf-8'),
+                       'uri':  unicode(entry.get_string(RB.RhythmDBPropType.LOCATION),'utf-8')}
             
             rb_count = entry.get_ulong(RB.RhythmDBPropType.PLAY_COUNT)
             rb_rating = entry.get_double(RB.RhythmDBPropType.RATING)
             rb_last_played = entry.get_ulong(RB.RhythmDBPropType.LAST_PLAYED)
-            #rb_genre =  unicode(entry.get_string(RB.RhythmDBPropType.GENRE), 'utf-8')
+            rb_genre =  unicode(entry.get_string(RB.RhythmDBPropType.GENRE), 'utf-8')
 
             # Lookup the entry in the db
-            c.execute('''SELECT rating,lastPlayed,playCount FROM google
+            c.execute('''SELECT id,rating,lastPlayed,playCount,genre FROM google
                         WHERE title=? AND album=? AND artist=?''',
                         (rbTrack['title'], rbTrack['album'], rbTrack['artist']))
 
             row = c.fetchone()
 
             if row:
-                
-                google_rating = row[0]
-                google_last_played = row[1] / 1000000
-                google_count = row[2]
+
+                google_id = row[0]
+                google_rating = row[1]
+                google_last_played = row[2] / 1000000
+                google_count = row[3]
+                google_genre = row[4]
+
+
+                # Add it to a playlist
+                for row in c.execute('SELECT playlist_name FROM playlist_entries WHERE track_id=?', [google_id]):
+                    try:
+                        shell.props.playlist_manager.create_static_playlist(row[0])
+                    except:
+                        print "WARN: Unable to create playlist \"{0}\"".format(row[0])
+                            
+                    try:
+                        shell.props.playlist_manager.add_to_playlist(row[0], rbTrack['uri'])
+                    except Exception, e:
+                        print e
+                        
                 
                 updated=False
                     
@@ -262,7 +327,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                 new_count = max(rb_count, google_count)
                 if google_count > rb_count:
                     updated=True
-                    print "playCount: %d --> %d" % (rb_count, google_count)
+                    print "playCount: %s (%d --> %d)" % (rb_title, rb_count, google_count)
                     if self.test == False:
                         self.db.entry_set(entry, RB.RhythmDBPropType.PLAY_COUNT, new_count)
                  
@@ -270,28 +335,47 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                 new_rating = max(rb_rating, google_rating)
                 if google_rating > rb_rating:
                     updated=True
-                    print "rating: %d --> %d" % (rb_rating, google_rating)
+                    print "rating: %s (%d --> %d)" % (rb_title, rb_rating, google_rating)
                     if self.test == False:
                         self.db.entry_set(entry, RB.RhythmDBPropType.RATING, new_rating)
                 
                 # Last Played
                 new_last_played = max(rb_last_played, google_last_played)
-                if google_last_played > rb_last_played:
+                if google_last_played > rb_last_played and google_count > rb_count:
                     updated=True
-                    print "lastPlayed: %s --> %s" % (rb_last_played, google_last_played)
+                    print "lastPlayed: %s (%d --> %d)" % (rb_title, rb_last_played,
+                                                          google_last_played)
                     if self.test == False:
-                        self.db.entry_set(entry, RB.RhythmDBPropType.LAST_PLAYED, new_last_played)
+                        self.db.entry_set(entry,
+                                          RB.RhythmDBPropType.LAST_PLAYED,
+                                          new_last_played)
+
+                # Genre
+                if rb_genre != google_genre:
+                    updated=True
+                    print "genre: %s (%s --> %s)" % (rb_title, rb_genre, google_genre)
+                    if self.test == False:
+                        self.db.entry_set(entry, RB.RhythmDBPropType.GENRE, str(google_genre))
+
+
 
                 if updated:
-                    lastPlayed_str = time.strftime("%b %d %I:%M %p",
+                    lastPlayed_str = time.strftime("%b %d %y %I:%M %p",
                                                   time.localtime(new_last_played))
-                    self.liststore.append([rbTrack['title'],
-                                           new_count,
-                                           new_rating,
-                                           lastPlayed_str])
+
+                    gStatsUtil.log ('INFO',
+                        "updated \"{0} - {1}\" ({2}, {3}, {4}) --> ({5}, {6}, {7})".format(
+                        rbTrack['artist'], rbTrack['title'], rb_count, rb_rating, rb_last_played,
+                        google_count, google_rating, google_last_played))
+                    
+                    self.liststore.append(
+                                    ["{0} - {1}".format(rbTrack['artist'], rbTrack['title']),
+                                    new_count,
+                                    new_rating,
+                                    lastPlayed_str])
 
             else:
-                print "GoogleSyncPlugin - no match for %s" % (rbTrack['title'])
+                print "GoogleSyncPlugin - no match for {0}".format(rb_title)
 
             # Update the progress in the GUI
             perc = i / float(size)
@@ -316,6 +400,7 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
 
 
     def rb_to_google_id(self, entry):
+        track_id = None
         db_file = rb.find_plugin_file(self, 'cache.db')
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
@@ -323,11 +408,12 @@ class GoogleSyncPlugin (GObject.Object, Peas.Activatable):
                         (entry.get_string(RB.RhythmDBPropType.ARTIST).decode('utf-8'),
                         entry.get_string(RB.RhythmDBPropType.ALBUM).decode('utf-8'),
                         entry.get_string(RB.RhythmDBPropType.TITLE).decode('utf-8')))
-        track_id = c.fetchone()[0]
+        row = c.fetchone()
+        if row != None:
+            track_id = row[0]
         c.close()
         conn.close()
         return track_id
-
 
 
 

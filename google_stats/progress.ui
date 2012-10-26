@@ -9,7 +9,7 @@
       <column type="guint"/>
       <!-- column-name Rating -->
       <column type="guint"/>
-      <!-- column-name Last Played -->
+      <!-- column-name Played -->
       <column type="gchararray"/>
     </columns>
   </object>
